@@ -1,0 +1,18 @@
+[Unit]
+Description=5G modem dial via ModemManager
+After=network.target ModemManager.service
+Wants=ModemManager.service
+Before=wg-quick@wg0.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# 启用第一个可用 modem 并以 cmnet APN 拨号；按运营商修改 APN。
+ExecStartPre=/usr/bin/mmcli -m any --enable
+ExecStart=/usr/bin/mmcli -m any --simple-connect="apn=ctnet,ip-type=ipv4"
+ExecStop=/usr/bin/mmcli -m any --simple-disconnect
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

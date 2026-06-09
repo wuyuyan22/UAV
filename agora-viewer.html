@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>UAV 图传</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  :root { --panel-w: min(1280px, 96vw); }
+  body { background:#0a0a1a; color:#ccc; font-family:system-ui; display:flex; flex-direction:column; align-items:center; min-height:100vh; padding:12px; }
+  h2 { color:#4fc3f7; margin-bottom:8px; font-size:1.25rem; }
+  .panel { width:var(--panel-w); max-width:100%; }
+  #log { font-size:12px; background:#111; padding:8px 16px; border-radius:6px; margin-bottom:10px; min-height:24px; }
+  .ok { color:#66bb6a; } .err { color:#ef5350; } .warn { color:#ffa726; }
+  .video-wrap { position:relative; width:var(--panel-w); max-width:100%; margin-bottom:10px; }
+  #video-box {
+    width:100%;
+    aspect-ratio:16 / 9;
+    border:2px solid #1e88e5;
+    border-radius:8px;
+    overflow:hidden;
+    background:#000;
+  }
+  #video-box video {
+    width:100%;
+    height:100%;
+    object-fit:contain;
+    display:block;
+    background:#000;
+  }
+  #video-box:fullscreen,
+  #video-box:-webkit-full-screen {
+    width:100vw;
+    height:100vh;
+    max-width:none;
+    aspect-ratio:unset;
+    border-radius:0;
+    border:none;
+  }
+  .controls { display:flex; gap:8px; flex-wrap:wrap; justify-content:center; margin-top:4px; }
+  button { padding:10px 28px; border:none; border-radius:6px; font-size:15px; cursor:pointer; transition:background 0.2s; }
+  button:disabled { opacity:0.45; cursor:not-allowed; }
+  .join { background:#1e88e5; color:#fff; }
+  .join:hover:not(:disabled) { background:#1565c0; }
+  .leave { background:#e53935; color:#fff; }
+  .leave:hover:not(:disabled) { background:#c62828; }
+  .fs { background:#37474f; color:#fff; }
+  .fs:hover:not(:disabled) { background:#263238; }
+  #stats { font-size:13px; color:#78909c; margin-bottom:8px; line-height:1.6; text-align:center; min-height:1.6em; }
+  #stats.bad { color:#ef5350; }
+  #hint { font-size:12px; color:#546e7a; margin-bottom:8px; text-align:center; line-height:1.5; }
+</style>
+</head>
+<body>
+
+<h2>UAV 图传测试</h2>
+<div id="log" class="panel">未连接</div>
+<div class="video-wrap panel">
+  <div id="video-box"></div>
+</div>
+<div id="stats" class="panel">等待加入频道…</div>
+<div id="hint" class="panel">提示：请保持本页在前台；外部 H.264 推流时 SDK 接收 fps 仅供参考，以画面流畅度为准。</div>
+<div class="controls">
+  <button class="join" id="btn-join" onclick="toggle()">加入频道</button>
+  <button class="fs" id="btn-fullscreen" onclick="toggleFullscreen()" disabled title="全屏播放">全屏</button>
+</div>
+
+<script src="https://download.agora.io/sdk/release/AgoraRTC_N-4.22.0.js"></script>
+<script>
+const APP_ID  = '9e6e7036db144983aa62a1548a0367a9';
+const CHANNEL = 'test';
+
+let client = null;
+let joined = false;
+let statsTimer = null;
+let remoteVideoUid = null;
+let remoteVideoTrack = null;
+let renderFps = 0;
+let lastPlaybackFrames = 0;
+let statsEmptyTicks = 0;
+let keepAliveTimer = null;
+
+function log(msg, cls) {
+  document.getElementById('log').innerHTML = `<span class="${cls||''}">${msg}</span>`;
+  console.log(msg);
+}
+
+function getVideoEl() {
+  return document.querySelector('#video-box video');
+}
+
+function pickRemoteVideoStats(all, uid) {
+  if (!all || typeof all !== 'object') return null;
+  const keys = Object.keys(all);
+  if (keys.length === 0) return null;
+  const uidStr = String(uid);
+  return all[uidStr] || all[uid] || all[Number(uid)] || all[keys[0]];
+}
+
+function resetStatsDisplay() {
+  renderFps = 0;
+  lastPlaybackFrames = 0;
+  statsEmptyTicks = 0;
+  document.getElementById('stats').className = '';
+  document.getElementById('stats').textContent = '等待加入频道…';
+}
+
+function clearStatsTimers() {
+  if (statsTimer) {
+    clearInterval(statsTimer);
+    statsTimer = null;
+  }
+  if (keepAliveTimer) {
+    clearInterval(keepAliveTimer);
+    keepAliveTimer = null;
+  }
+}
+
+function stopStatsTimer() {
+  clearStatsTimers();
+  remoteVideoUid = null;
+  remoteVideoTrack = null;
+  resetStatsDisplay();
+}
+
+function applyLowLatencyVideoHints(videoEl) {
+  if (!videoEl) return;
+  videoEl.muted = true;
+  videoEl.autoplay = true;
+  videoEl.playsInline = true;
+  videoEl.disablePictureInPicture = true;
+  videoEl.setAttribute('playsinline', '');
+  videoEl.setAttribute('webkit-playsinline', '');
+  if ('latencyHint' in videoEl) {
+    videoEl.latencyHint = 'interactive';
+  }
+}
+
+async function ensureVideoPlaying() {
+  const v = getVideoEl();
+  if (!v || document.hidden) return;
+  if (v.paused || v.readyState < 2) {
+    try {
+      await v.play();
+    } catch (e) {
+      console.warn('[viewer] video.play() failed:', e.message);
+    }
+  }
+}
+
+function startPlaybackKeepAlive() {
+  if (keepAliveTimer) clearInterval(keepAliveTimer);
+  keepAliveTimer = setInterval(ensureVideoPlaying, 2000);
+}
+
+function sampleRenderFps() {
+  const v = getVideoEl();
+  if (!v) return 0;
+
+  if (typeof v.getVideoPlaybackQuality === 'function') {
+    const total = v.getVideoPlaybackQuality().totalVideoFrames || 0;
+    const delta = total - lastPlaybackFrames;
+    lastPlaybackFrames = total;
+    return delta;
+  }
+
+  return renderFps;
+}
+
+function updateStatsLine() {
+  const el = document.getElementById('stats');
+  if (!joined) return;
+
+  renderFps = sampleRenderFps();
+
+  let recvLabel = '--';
+  let delay = '--';
+  let loss = '--';
+  let extra = '';
+
+  if (remoteVideoUid != null) {
+    const all = client.getRemoteVideoStats();
+    const s = pickRemoteVideoStats(all, remoteVideoUid);
+    if (s) {
+      statsEmptyTicks = 0;
+      const recvFps = s.receiveFrameRate ?? s.decodeFrameRate;
+      recvLabel = recvFps != null ? `${recvFps} fps` : 'N/A(外部H.264)';
+      delay = String(s.end2EndDelay ?? s.receiveDelay ?? '--');
+      loss = s.packetLossRate != null
+        ? `${(s.packetLossRate * 100).toFixed(1)}%`
+        : '--';
+      const freeze = s.freezeRate != null
+        ? `${(s.freezeRate * 100).toFixed(1)}%`
+        : '--';
+      extra = ` | 卡顿: ${freeze}`;
+    } else {
+      statsEmptyTicks++;
+      recvLabel = statsEmptyTicks < 5 ? '加载中…' : 'N/A(外部H.264)';
+    }
+  }
+
+  const delayNum = Number(delay);
+  const lossNum = parseFloat(loss);
+  if (renderFps < 8 || (delayNum > 2000) || lossNum > 5) {
+    el.className = 'bad';
+  } else {
+    el.className = '';
+  }
+
+  const v = getVideoEl();
+  const state = v ? `${v.videoWidth}×${v.videoHeight} ${v.paused ? 'paused' : 'playing'}` : '无video';
+
+  el.textContent =
+    `渲染: ${renderFps} fps | SDK接收: ${recvLabel} | 延迟: ${delay} ms | 丢包: ${loss}${extra} | ${state}`;
+}
+
+function startStatsTimer() {
+  clearStatsTimers();
+  lastPlaybackFrames = 0;
+  statsTimer = setInterval(updateStatsLine, 1000);
+  updateStatsLine();
+}
+
+client = AgoraRTC.createClient({
+  mode: 'live',
+  codec: 'h264',
+  clientRoleOptions: { level: 2 }
+});
+
+client.on('user-published', async (remoteUser, mediaType) => {
+  log(`发现远端流: user=${remoteUser.uid} type=${mediaType}`, 'warn');
+  await client.subscribe(remoteUser, mediaType);
+  log(`已订阅: ${mediaType}`, 'ok');
+
+  if (mediaType === 'video') {
+    remoteVideoUid = remoteUser.uid;
+    remoteVideoTrack = remoteUser.videoTrack;
+    await remoteUser.videoTrack.play('video-box', { fit: 'contain' });
+    applyLowLatencyVideoHints(getVideoEl());
+    await ensureVideoPlaying();
+    startPlaybackKeepAlive();
+    log('视频播放中（超低延迟 level=2）', 'ok');
+    setFullscreenEnabled(true);
+    startStatsTimer();
+
+    remoteUser.videoTrack.on('first-frame-decoded', () => {
+      log('首帧已解码', 'ok');
+      const v = getVideoEl();
+      if (v && typeof v.getVideoPlaybackQuality === 'function') {
+        lastPlaybackFrames = v.getVideoPlaybackQuality().totalVideoFrames || 0;
+      }
+      ensureVideoPlaying();
+      updateStatsLine();
+    });
+  }
+});
+
+client.on('user-unpublished', (remoteUser) => {
+  log(`远端停止发布: ${remoteUser.uid}`, 'warn');
+  if (String(remoteUser.uid) === String(remoteVideoUid)) {
+    stopStatsTimer();
+    setFullscreenEnabled(false);
+  }
+});
+
+client.on('connection-state-change', (cur, prev) => {
+  log(`连接: ${prev} → ${cur}`, cur === 'CONNECTED' ? 'ok' : 'err');
+});
+
+document.addEventListener('visibilitychange', async () => {
+  if (document.hidden) {
+    console.warn('[viewer] 标签页在后台：浏览器会降帧，画面易卡顿');
+    return;
+  }
+  await ensureVideoPlaying();
+  if (getVideoEl()) {
+    lastPlaybackFrames = getVideoEl().getVideoPlaybackQuality?.().totalVideoFrames || 0;
+  }
+  updateStatsLine();
+});
+
+async function join() {
+  try {
+    await client.setClientRole('audience', { level: 2 });
+    await client.join(APP_ID, CHANNEL, null, null);
+    joined = true;
+    log(`已加入频道 uid=${client.uid}（超低延迟观众 level=2）`, 'ok');
+    document.getElementById('btn-join').textContent = '离开频道';
+    document.getElementById('btn-join').className = 'leave';
+    startStatsTimer();
+  } catch (e) {
+    log(`加入失败: ${e.message}`, 'err');
+  }
+}
+
+async function leave() {
+  if (getFullscreenElement()) {
+    await (document.exitFullscreen?.() || document.webkitExitFullscreen?.()).catch(() => {});
+  }
+  stopStatsTimer();
+  setFullscreenEnabled(false);
+  updateFullscreenButton();
+  document.getElementById('video-box').innerHTML = '';
+  await client.leave();
+  joined = false;
+  log('未连接', '');
+  document.getElementById('btn-join').textContent = '加入频道';
+  document.getElementById('btn-join').className = 'join';
+}
+
+function toggle() { joined ? leave() : join(); }
+
+function getFullscreenElement() {
+  return document.fullscreenElement || document.webkitFullscreenElement || null;
+}
+
+function updateFullscreenButton() {
+  const btn = document.getElementById('btn-fullscreen');
+  const inFs = getFullscreenElement() === document.getElementById('video-box');
+  btn.textContent = inFs ? '退出全屏' : '全屏';
+  btn.title = inFs ? '退出全屏' : '全屏播放';
+}
+
+async function toggleFullscreen() {
+  const box = document.getElementById('video-box');
+  if (getFullscreenElement()) {
+    await (document.exitFullscreen?.() || document.webkitExitFullscreen?.());
+    return;
+  }
+  const req = box.requestFullscreen || box.webkitRequestFullscreen;
+  if (!req) {
+    log('当前浏览器不支持全屏', 'warn');
+    return;
+  }
+  try {
+    await req.call(box);
+    await ensureVideoPlaying();
+  } catch (e) {
+    log(`全屏失败: ${e.message}`, 'err');
+  }
+}
+
+function setFullscreenEnabled(enabled) {
+  document.getElementById('btn-fullscreen').disabled = !enabled;
+}
+
+document.addEventListener('fullscreenchange', () => {
+  updateFullscreenButton();
+  ensureVideoPlaying();
+});
+document.addEventListener('webkitfullscreenchange', updateFullscreenButton);
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && getFullscreenElement()) updateFullscreenButton();
+});
+</script>
+</body>
+</html>

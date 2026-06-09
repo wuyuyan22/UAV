@@ -1,0 +1,15 @@
+[Unit]
+Description=Apply HTB QoS for swarm uplink (MAVLink + RTP)
+After=swarm-modem.service wg-quick@wg0.service network-online.target
+Wants=swarm-modem.service wg-quick@wg0.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# 参数顺序：IFACE LINK_KBIT TELEM_KBIT VIDEO_KBIT GCS_PORT RTP_PORT_BASE
+# IFACE 默认 wg0；若 VPN 未启用，可改 wwan0/usb0/ppp0
+ExecStart=/usr/local/sbin/swarm-qos.sh wg0 4000 512 2500 14550 5000
+ExecStopPost=/usr/sbin/tc qdisc del dev wg0 root
+
+[Install]
+WantedBy=multi-user.target

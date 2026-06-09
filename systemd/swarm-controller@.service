@@ -1,0 +1,47 @@
+[Unit]
+Description=UAV Swarm Controller (sysid=%i)
+After=swarm-qos.service network-online.target
+Requires=wg-quick@wg0.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 角色与 sysid 经环境文件区分；/etc/default/swarm-<sysid>.env 内置 ROLE=1/2、GCS_HOST/PORT 等
+EnvironmentFile=-/etc/default/swarm-%i.env
+Environment=ROLE=2
+Environment=GCS_HOST=10.8.0.100
+Environment=GCS_PORT=14550
+Environment=LEADER_IP=10.8.0.1
+Environment=LINK_PORT=19870
+Environment=CTRL_HZ=10
+Environment=GCS_TX_KBPS=384
+Environment=GCS_HB_HZ=1
+Environment=HEALTH_WARN_MS=3000
+Environment=HEALTH_LOST_MS=8000
+Environment=DEGRADE_LOST=loiter
+Environment=EXTRA_ARGS=
+
+ExecStart=/opt/swarm/bin/swarm_node %i ${ROLE} \
+          --link-port ${LINK_PORT} --leader-ip ${LEADER_IP} --hz ${CTRL_HZ} \
+          --gcs-link ip \
+          --gcs-udp-target ${GCS_HOST}:${GCS_PORT} \
+          --gcs-udp-tx-kbps ${GCS_TX_KBPS} \
+          --gcs-heartbeat-hz ${GCS_HB_HZ} \
+          --health-warn-ms ${HEALTH_WARN_MS} \
+          --health-lost-ms ${HEALTH_LOST_MS} \
+          --degrade-on-lost ${DEGRADE_LOST} \
+          --no-follower-synthetic-telem-gcs \
+          ${EXTRA_ARGS}
+
+Restart=on-failure
+RestartSec=3
+# 实时调度需 CAP_SYS_NICE；嵌入式默认内核常拒绝 fifo，勿在此强开以免 SETSCHEDULER 214
+# 若需更低延迟，在 /etc/systemd/system/swarm-controller@.service.d/override.conf 中加：
+#   Nice=-5
+#   CPUSchedulingPolicy=fifo
+#   CPUSchedulingPriority=10
+# 并配合 limits.conf 或 AmbientCapabilities=CAP_SYS_NICE
+TimeoutStopSec=5
+
+[Install]
+WantedBy=multi-user.target
